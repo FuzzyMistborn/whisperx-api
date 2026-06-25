@@ -192,12 +192,16 @@ class TTLCache(dict):
     def sweep(self, ttl: int):
         now = time.time()
         evicted = []
-        for k, (_, ts) in list(self.items()):
+        for k, (obj, ts) in list(self.items()):
             if now - ts > ttl:
                 del self[k]
+                del obj  # explicitly drop model reference before empty_cache()
                 evicted.append(k)
         # Flush CUDA cache once after all evictions rather than per-entry.
+        # gc.collect() first ensures any lingering Python-level refs are gone
+        # so empty_cache() can actually return the memory to the driver pool.
         if evicted:
+            gc.collect()
             torch.cuda.empty_cache()
             key_label = {"align": "lang", "diarize": "model"}[self.label]
             for k in evicted:
@@ -280,14 +284,24 @@ class WhisperPool:
         return self.available.qsize() == len(self.instances) == self.size
 
     def evict(self):
-        """Drop all model references; caller must ensure no one is using them."""
-        self.instances.clear()
-        # drain queue
+        """Drop all model references and free CUDA memory.
+
+        Caller must ensure no one is currently using an instance from this pool.
+        Drains the queue first so we hold the only remaining references before
+        deleting, ensuring empty_cache() can actually return memory to the driver.
+        """
+        # Drain the queue first so we hold the only references.
         try:
             while True:
                 self.available.get_nowait()
         except asyncio.QueueEmpty:
             pass
+        # Explicitly delete each model to trigger CUDA deallocation.
+        for model in self.instances:
+            del model
+        self.instances.clear()
+        gc.collect()
+        torch.cuda.empty_cache()
 
 
 WHISPER_POOLS: Dict[Tuple[str, "ASROptions"], WhisperPool] = {}
