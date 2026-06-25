@@ -156,7 +156,7 @@ if TRANSCRIBE_CONCURRENCY > 1:
     )
 
 # Warmup flags
-WARMUP_MODEL = os.getenv("WARMUP_MODEL", "large-v3")
+WARMUP_MODEL = os.getenv("WARMUP_MODEL", "")
 WARMUP_ALIGN_LANGS = [lang.strip() for lang in os.getenv("WARMUP_ALIGN_LANGS", "en").split(",")]
 WARMUP_DIARIZE = os.getenv("WARMUP_DIARIZE", "0") == "1"
 
@@ -409,25 +409,32 @@ async def load_diar(model_name: str | None = None):
 async def warmup():
     """Pre-loads default models for faster first-request processing.
 
+    Disabled by default (WARMUP_MODEL="") to avoid holding VRAM when the
+    container is idle. Set WARMUP_MODEL to a valid model ID to enable.
+
     Failures on individual steps are logged as warnings and never crash the
     server – a missing model during warmup is recoverable (it will be loaded
     on first request, or fail there with a proper HTTP 400/500).
     """
-    logging.info("Warming up...")
+    if not WARMUP_MODEL:
+        logging.info("Warmup disabled (WARMUP_MODEL not set).")
+        return
     if WARMUP_MODEL not in _MODELS:
         logging.warning("WARMUP_MODEL '%s' not found in _MODELS, skipping.", WARMUP_MODEL)
-    else:
-        asr_config = ASR_CONFIG.get(WARMUP_MODEL, {})
-        asr_options = ASROptions(
-            beam_size=asr_config.get("beam_size"),
-            patience=asr_config.get("patience"),
-            length_penalty=asr_config.get("length_penalty"),
-            best_of=asr_config.get("best_of"),
-        )
-        try:
-            await get_whisper_pool(WARMUP_MODEL, asr_options).ensure_loaded()
-        except Exception as e:
-            logging.warning("Warmup: failed to load whisper model '%s': %s", WARMUP_MODEL, e)
+        return
+
+    logging.info("Warming up...")
+    asr_config = ASR_CONFIG.get(WARMUP_MODEL, {})
+    asr_options = ASROptions(
+        beam_size=asr_config.get("beam_size"),
+        patience=asr_config.get("patience"),
+        length_penalty=asr_config.get("length_penalty"),
+        best_of=asr_config.get("best_of"),
+    )
+    try:
+        await get_whisper_pool(WARMUP_MODEL, asr_options).ensure_loaded()
+    except Exception as e:
+        logging.warning("Warmup: failed to load whisper model '%s': %s", WARMUP_MODEL, e)
 
     for lang in WARMUP_ALIGN_LANGS:
         if not lang:
