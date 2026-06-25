@@ -10,13 +10,14 @@ WhisperX Transcription API · v1.11.0
 •  `/v1/models`
       – online:  every Faster-Whisper variant + "downloaded" flag
       – offline: only variants that truly exist on disk
-•  Offline mode now returns HTTP 400 when the requested model isn’t cached
+•  Offline mode now returns HTTP 400 when the requested model isn't cached
 •  TF32 permanently disabled (reproducibility)
 """
 
 # ───────── CUDA / TF32 OFF ─────────
 import contextlib
 import json
+import math
 import os, time, logging, threading, tempfile, gc, torch, asyncio
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -38,9 +39,15 @@ torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
 assert torch.cuda.is_available(), "CUDA GPU required"
 
-DEVICE, COMPUTE_TYPE, BATCH_SIZE = "cuda", "float16", 16
-EXECUTOR   = ThreadPoolExecutor(max_workers=int(os.getenv("MAX_THREADS", "4")))
-FW_THREADS = int(os.getenv("FASTER_WHISPER_THREADS", "0"))  # 0 ⇒ not forwarded
+DEVICE       = "cuda"
+COMPUTE_TYPE = "float16"
+# Configurable via env; default lowered to 8 to reduce VRAM pressure.
+# WhisperX batch_size=16 (the old default) over-allocates activation memory
+# and is the primary cause of "CUDA out of memory" on jobs that work fine
+# with stock WhisperX (which uses lower or adaptive batch sizes).
+BATCH_SIZE   = int(os.getenv("BATCH_SIZE", "8"))
+EXECUTOR     = ThreadPoolExecutor(max_workers=int(os.getenv("MAX_THREADS", "4")))
+FW_THREADS   = int(os.getenv("FASTER_WHISPER_THREADS", "0"))  # 0 ⇒ not forwarded
 
 _MB = 1024 * 1024
 def free_mb() -> int:
@@ -141,6 +148,13 @@ TRANSCRIBE_CONCURRENCY = max(1, int(os.getenv("TRANSCRIBE_CONCURRENCY", "1")))
 if OFFLINE:
     os.environ["HF_HUB_OFFLINE"] = "1"
 
+if TRANSCRIBE_CONCURRENCY > 1:
+    logging.warning(
+        "TRANSCRIBE_CONCURRENCY=%d — each pool slot loads a full model copy into VRAM. "
+        "Ensure sufficient GPU memory (large-v3 uses ~5-6 GB per instance).",
+        TRANSCRIBE_CONCURRENCY,
+    )
+
 # Warmup flags
 WARMUP_MODEL = os.getenv("WARMUP_MODEL", "large-v3")
 WARMUP_ALIGN_LANGS = [lang.strip() for lang in os.getenv("WARMUP_ALIGN_LANGS", "en").split(",")]
@@ -177,12 +191,18 @@ class TTLCache(dict):
     def put(self, k, obj): super().__setitem__(k, (obj, time.time()))
     def sweep(self, ttl: int):
         now = time.time()
+        evicted = []
         for k, (_, ts) in list(self.items()):
             if now - ts > ttl:
-                del self[k]; torch.cuda.empty_cache()
-                key = {"align": "lang", "diarize": "model"}[self.label]
+                del self[k]
+                evicted.append(k)
+        # Flush CUDA cache once after all evictions rather than per-entry.
+        if evicted:
+            torch.cuda.empty_cache()
+            key_label = {"align": "lang", "diarize": "model"}[self.label]
+            for k in evicted:
                 logging.info("[%s_model_unload]  %s=%s  freeVRAM=%d MB",
-                             self.label, key, k, free_mb())
+                             self.label, key_label, k, free_mb())
 
 A_CACHE, D_CACHE = TTLCache("align"), TTLCache("diarize")
 
@@ -440,10 +460,14 @@ def split_segments_by_speaker(segments: list[dict]) -> list[dict]:
             new_segments.append(segment)
             continue
 
-        current_speaker = segment["words"][0].get("speaker")
+        # Fall back to segment-level speaker for words that lack one.
+        # This handles the case where diarization doesn't cover the full audio
+        # and some words are left without a speaker attribution.
+        seg_speaker = segment.get("speaker")
+        current_speaker = segment["words"][0].get("speaker") or seg_speaker
         current_words = []
         for i, word in enumerate(segment["words"]):
-            speaker = word.get("speaker")
+            speaker = word.get("speaker") or seg_speaker
 
             is_new_sentence = False
             if i > 0:
@@ -560,7 +584,7 @@ async def process(path, model, lang, do_align, do_diar, trans_kw, diar_kw, diar_
     t0 = time.perf_counter()
 
     try:
-        # transcription
+        # ── transcription ──────────────────────────────────────────────────
         _log("transcribe_start", fname, "model=%s", model)
         asr_config = ASR_CONFIG.get(model, {})
         asr_options = ASROptions(
@@ -578,19 +602,25 @@ async def process(path, model, lang, do_align, do_diar, trans_kw, diar_kw, diar_
             else:
                 _log("transcribe_opts", fname, "lang=auto")
             raw = await run_sync(whisper.transcribe, wav, **transcribe_kw)
+
         res = standardize(raw)
+        del raw  # release raw result dict; segments are in res
+        # Clear CUDA cache after transcription so alignment has more headroom.
+        torch.cuda.empty_cache()
         _log("transcribe_end", fname, "Δ=%.2fs", time.perf_counter() - t0)
 
-        # alignment
+        # ── alignment ──────────────────────────────────────────────────────
         if do_align:
             t = time.perf_counter(); lang_used = res.get("language") or lang
             _log("align_start", fname, "lang=%s", lang_used)
             model_a, meta = await load_align(lang_used)
             res = standardize(await run_sync(
                 whisperx.align, res["segments"], model_a, meta, wav, DEVICE))
+            # Clear cache after alignment so diarization has more headroom.
+            torch.cuda.empty_cache()
             _log("align_end", fname, "Δ=%.2fs", time.perf_counter() - t)
 
-        # diarisation
+        # ── diarisation ────────────────────────────────────────────────────
         if do_diar:
             t = time.perf_counter(); _log("diarize_start", fname)
             diar_pipe = await load_diar(diar_model_name)
@@ -604,6 +634,12 @@ async def process(path, model, lang, do_align, do_diar, trans_kw, diar_kw, diar_
     except Exception as e:
         logging.error("Error during processing of %s: %s", fname, e, exc_info=True)
         raise HTTPException(status_code=500, detail=f"Error during processing: {e}")
+    finally:
+        # Always release the audio array and flush the CUDA allocator,
+        # regardless of success or failure.  This is the main guard against
+        # VRAM leaks across requests.
+        del wav
+        torch.cuda.empty_cache()
 
     wall = time.perf_counter() - t0
     logging.info("[summary] %s Δ=%.2fs audio=%.2fs speed=%.1fx",
@@ -613,13 +649,13 @@ async def process(path, model, lang, do_align, do_diar, trans_kw, diar_kw, diar_
 
 # ───────── KW builders ─────────
 def build_transcribe_kwargs(batch, word_ts, vad, vad_thr):
-    kw = {"batch_size": batch or BATCH_SIZE}
+    # Guard against None and against the falsy-zero bug: batch=0 previously
+    # fell through `batch or BATCH_SIZE` and silently used the default.
+    kw = {"batch_size": batch if batch is not None else BATCH_SIZE}
     if vad:
         kw["vad_filter"] = True
-        # `vad_threshold` may legitimately be ``0``.  The previous truthy check
-        # skipped applying the user-provided threshold when it was ``0`` and
-        # fell back to the default.  Explicitly guard against ``None`` instead
-        # so zero is forwarded correctly.
+        # Guard against None rather than truthiness so vad_threshold=0 is
+        # forwarded correctly (it is a valid probability threshold).
         if vad_thr is not None:
             kw["vad_parameters"] = {"threshold": vad_thr}
     if word_ts: kw["word_timestamps"] = True
@@ -627,17 +663,23 @@ def build_transcribe_kwargs(batch, word_ts, vad, vad_thr):
 
 def build_diar_kwargs(min_spk, max_spk):
     d = {}
-    if min_spk: d["min_speakers"] = min_spk
-    if max_spk: d["max_speakers"] = max_spk
+    # Only forward non-None, positive values.  Defaults of None (not 0) in the
+    # form params ensure we never send min_speakers=0 to pyannote, which would
+    # be interpreted as "zero speakers allowed" rather than "unconstrained".
+    if min_spk is not None and min_spk > 0:
+        d["min_speakers"] = min_spk
+    if max_spk is not None and max_spk > 0:
+        d["max_speakers"] = max_spk
     return d
 
 def _usage(res):
     """OpenAI-compatible usage object (duration variant, in seconds).
 
-    LiteLLM's TranscriptionUsageDurationObject validates `seconds` as int,
-    so we round up to avoid a ValidationError on fractional durations.
+    LiteLLM's TranscriptionUsageDurationObject validates `seconds` as int.
+    Use math.ceil() to round up fractional durations correctly — the previous
+    `int(...) + 1` always added a full extra second regardless of the fraction.
     """
-    return {"type": "duration", "seconds": int(res.get("duration", 0)) + 1}
+    return {"type": "duration", "seconds": math.ceil(res.get("duration", 0))}
 
 def _fmt(res, fmt):
     """Format transcription results according to the requested response format."""
@@ -661,12 +703,12 @@ def common_form_params(
     align: bool = Form(False, description="Word-level alignment via Wav2Vec2."),
     diarize: bool = Form(False, description="Speaker diarisation with `[SPK_n]` tags."),
     response_format: ResponseFormat = Form("json", description="Response format (`json`, `text`, `srt`, `vtt`, `verbose_json`)."),
-    batch_size: int | None = Form(BATCH_SIZE, description="Whisper batch size."),
+    batch_size: int | None = Form(None, description=f"Whisper batch size (default: {BATCH_SIZE}, set via BATCH_SIZE env var)."),
     word_timestamps: bool = Form(False, description="Include word timestamps (needs new FW build)."),
     vad_filter: bool = Form(False, description="Apply VAD before transcription."),
-    vad_threshold: float | None = Form(0.5, description="VAD probability threshold."),
-    min_speakers: int | None = Form(0, description="Lower bound for diarisation clustering."),
-    max_speakers: int | None = Form(0, description="Upper bound for diarisation clustering."),
+    vad_threshold: float | None = Form(None, description="VAD probability threshold (default: 0.5 when vad_filter=True)."),
+    min_speakers: int | None = Form(None, description="Lower bound for diarisation clustering."),
+    max_speakers: int | None = Form(None, description="Upper bound for diarisation clustering."),
     diarization_model: str | None = Form(
         None,
         description="Override diarization model (e.g. 'pyannote/speaker-diarization-3.1'). "
@@ -689,22 +731,34 @@ async def transcriptions(
     params: dict = Depends(common_form_params),
 ):
     """Transcribes an audio file."""
-    with tempfile.NamedTemporaryFile(suffix=".audio") as tmp:
+    with tempfile.NamedTemporaryFile(suffix=".audio", delete=False) as tmp:
         tmp.write(await file.read())
         tmp.flush()
+        os.fsync(tmp.fileno())
+        tmp_path = tmp.name
+
+    try:
         # Sanitize language: treat empty strings or 'auto'/'detect' as None
         lang = (language or "").strip() or None
         if lang and lang.lower() in ("auto", "detect", "autodetect"):
             lang = None
         res = await process(
-            tmp.name, params["model"], lang, params["align"], params["diarize"],
+            tmp_path, params["model"], lang, params["align"], params["diarize"],
             build_transcribe_kwargs(
                 params["batch_size"], params["word_timestamps"],
                 params["vad_filter"], params["vad_threshold"]),
             build_diar_kwargs(params["min_speakers"], params["max_speakers"]),
             params["diarization_model"],
         )
-        return _fmt(res, params["response_format"])
+    finally:
+        # Manually manage deletion so the file is guaranteed to exist for the
+        # entire duration of the async process() call (delete=False above).
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+    return _fmt(res, params["response_format"])
 
 @app.post("/v1/audio/translations")
 async def translations(
@@ -712,15 +766,25 @@ async def translations(
     params: dict = Depends(common_form_params),
 ):
     """Translates an audio file to English."""
-    with tempfile.NamedTemporaryFile(suffix=".audio") as tmp:
+    with tempfile.NamedTemporaryFile(suffix=".audio", delete=False) as tmp:
         tmp.write(await file.read())
         tmp.flush()
+        os.fsync(tmp.fileno())
+        tmp_path = tmp.name
+
+    try:
         res = await process(
-            tmp.name, params["model"], None, params["align"], params["diarize"],
+            tmp_path, params["model"], None, params["align"], params["diarize"],
             build_transcribe_kwargs(
                 params["batch_size"], params["word_timestamps"],
                 params["vad_filter"], params["vad_threshold"]),
             build_diar_kwargs(params["min_speakers"], params["max_speakers"]),
             params["diarization_model"],
         )
-        return _fmt(res, params["response_format"])
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+    return _fmt(res, params["response_format"])
