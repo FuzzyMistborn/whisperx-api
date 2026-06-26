@@ -590,6 +590,19 @@ def _sweep():
         time.sleep(60)
         _sweep_pools()
         A_CACHE.sweep(TTL_SEC); D_CACHE.sweep(TTL_SEC); gc.collect()
+        # If all models have been evicted, exit the process so the CUDA
+        # context is fully released back to the driver — empty_cache() alone
+        # doesn't free PyTorch's reserved memory pool.  Docker's restart
+        # policy (restart: unless-stopped) will bring the container back up
+        # automatically, ready for the next job with a clean CUDA context.
+        with _POOLS_LOCK:
+            pools_empty = len(WHISPER_POOLS) == 0
+        if pools_empty and not A_CACHE and not D_CACHE:
+            logging.info(
+                "All models evicted and CUDA context idle — exiting process "
+                "to release VRAM. Docker will restart the container."
+            )
+            os._exit(0)
 threading.Thread(target=_sweep, daemon=True).start()
 
 # ───────── Pipeline ─────────
