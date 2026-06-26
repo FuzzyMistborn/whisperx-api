@@ -756,7 +756,7 @@ def _fmt(res, fmt):
 
 # ───────── Dependencies ─────────
 def common_form_params(
-    model: ModelId = Form("large-v3", description="Faster-Whisper model ID (see `/v1/models`)."),
+    model: ModelId = Form("large-v3-turbo", description="Faster-Whisper model ID (see `/v1/models`)."),
     align: bool = Form(False, description="Word-level alignment via Wav2Vec2."),
     diarize: bool = Form(False, description="Speaker diarisation with `[SPK_n]` tags."),
     response_format: ResponseFormat = Form("json", description="Response format (`json`, `text`, `srt`, `vtt`, `verbose_json`)."),
