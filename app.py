@@ -155,6 +155,12 @@ if TRANSCRIBE_CONCURRENCY > 1:
         TRANSCRIBE_CONCURRENCY,
     )
 
+# Set to True the first time any model is loaded in this process lifetime.
+# Prevents the idle-exit logic from triggering on a fresh container that has
+# never served a job (caches are empty at startup, which would otherwise
+# immediately satisfy the exit condition on the first sweep tick).
+_any_model_loaded = False
+
 # Warmup flags
 WARMUP_MODEL = os.getenv("WARMUP_MODEL", "")
 WARMUP_ALIGN_LANGS = [lang.strip() for lang in os.getenv("WARMUP_ALIGN_LANGS", "en").split(",")]
@@ -246,7 +252,10 @@ class WhisperPool:
         if FW_THREADS:
             load_kw["threads"] = FW_THREADS
         try:
-            return whisperx.load_model(self.model_id, **load_kw)
+            model = whisperx.load_model(self.model_id, **load_kw)
+            global _any_model_loaded
+            _any_model_loaded = True
+            return model
         except LocalEntryNotFoundError:
             raise HTTPException(
                 status_code=400,
@@ -360,6 +369,8 @@ async def load_align(lang: str):
         before = free_mb(); _load_start("align", key)
         model, meta = await run_sync(
             whisperx.load_align_model, language_code=lang or "en", device=DEVICE)
+        global _any_model_loaded
+        _any_model_loaded = True
         A_CACHE.put(key, (model, meta)); _load_end("align", key, before)
         return model, meta
 
@@ -402,6 +413,8 @@ async def load_diar(model_name: str | None = None):
                 detail=(f"Diarization model '{diar_model_name}' is not cached locally and "
                         "LOCAL_ONLY_MODELS=1 prevents downloading.")
             ) from None
+        global _any_model_loaded
+        _any_model_loaded = True
         D_CACHE.put(diar_model_name, pip); _load_end("diarize", diar_model_name, before)
         return pip
 
@@ -607,7 +620,7 @@ def _sweep():
         # doesn't free PyTorch's reserved memory pool.  Docker's restart
         # policy (restart: unless-stopped) will bring the container back up
         # automatically, ready for the next job with a clean CUDA context.
-        if pools_empty and a_empty and d_empty:
+        if pools_empty and a_empty and d_empty and _any_model_loaded:
             logging.info(
                 "All models evicted and CUDA context idle — exiting process "
                 "to release VRAM. Docker will restart the container."
