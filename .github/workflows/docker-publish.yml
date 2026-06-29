@@ -2,7 +2,7 @@ name: Docker
 
 on:
   schedule:
-    - cron: '33 9 * * *'
+    - cron: '00 9 * * 5'
   push:
     branches: [ "main" ]
     tags: [ 'v*.*.*' ]
